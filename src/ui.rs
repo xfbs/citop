@@ -44,21 +44,11 @@ fn status_style(status: Status) -> Style {
     }
 }
 
-fn status_symbol(status: Status) -> &'static str {
-    match status {
-        Status::Failed => "✗",
-        Status::Running => "●",
-        Status::Queued => "◌",
-        Status::Manual => "◆",
-        Status::Success => "✓",
-        Status::Canceled => "⊘",
-        Status::Skipped => "»",
-        Status::Unknown => "?",
-    }
-}
+/// Wide enough for every status word.
+const STATUS_WIDTH: u16 = 8;
 
 fn status_cell(status: Status) -> Cell<'static> {
-    Cell::from(format!("{} {status}", status_symbol(status))).style(status_style(status))
+    Cell::from(status.to_string()).style(status_style(status))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -80,6 +70,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             format!("{failing} failing"),
             status_style(Status::Failed),
         ));
+    }
+    spans.push(Span::from(format!("  sorted by {}", app.sort.label())).dim());
+    if !app.filter.is_empty() && app.mode != Mode::Filter {
+        spans.push(Span::from(format!("  filter \"{}\"", app.filter)).dim());
     }
 
     let mut right = Vec::new();
@@ -117,34 +111,47 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc
         .selected
         .as_ref()
         .and_then(|s| visible.iter().position(|p| &p.key == s));
-    let rows: Vec<Row> = visible.iter().map(|p| project_row(p, now)).collect();
+    let rows: Vec<Row> = visible
+        .iter()
+        .map(|p| project_row(p, &app.sources[p.key.source].name, now))
+        .collect();
     let empty = rows.is_empty();
+    let source_width = app
+        .sources
+        .iter()
+        .map(|s| s.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("SOURCE".len()) as u16;
 
     let focused = app.focus == Focus::Projects;
-    let title = if app.filter.is_empty() {
-        " Projects ".to_string()
-    } else {
-        format!(" Projects matching \"{}\" ", app.filter)
-    };
     let table = Table::new(
         rows,
         [
-            Constraint::Length(11),
+            Constraint::Length(STATUS_WIDTH),
+            Constraint::Length(source_width),
             Constraint::Fill(3),
             Constraint::Fill(1),
+            Constraint::Length(8),
             Constraint::Length(10),
-            Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(8),
         ],
     )
     .header(
         Row::new([
-            "STATUS", "PROJECT", "BRANCH", "COMMIT", "+ACT", "AGE", "DURATION",
+            "STATUS",
+            "SOURCE",
+            "PROJECT",
+            "BRANCH",
+            "COMMIT",
+            "OTHER REFS",
+            "AGE",
+            "DURATION",
         ])
         .style(Style::new().bold()),
     )
-    .block(panel(title, focused))
+    .column_spacing(2)
     .row_highlight_style(highlight(focused));
 
     app.table_state.select(selected);
@@ -160,23 +167,23 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc
         } else {
             "Discovering projects…"
         };
-        let inner = area.inner(ratatui::layout::Margin::new(2, 2));
+        let inner = area.inner(ratatui::layout::Margin::new(1, 2));
         frame.render_widget(Paragraph::new(text).dim(), inner);
     }
 }
 
-fn project_row(p: &ProjectState, now: DateTime<Utc>) -> Row<'static> {
+fn project_row(p: &ProjectState, source: &str, now: DateTime<Utc>) -> Row<'static> {
     let status = if !p.loaded && p.error.is_some() {
-        Cell::from("! error").style(status_style(Status::Failed))
+        Cell::from("error").style(status_style(Status::Failed))
     } else if !p.loaded {
-        Cell::from("… loading").dim()
+        Cell::from("loading").dim()
     } else {
         match p.default_status() {
             Some(status) => status_cell(status),
-            None => Cell::from("· none").dim(),
+            None => Cell::from("none").dim(),
         }
     };
-    let pipeline = p.default.as_ref().and_then(|c| c.pipelines.first());
+    let pipeline = p.latest_default();
     let elsewhere = p.active_elsewhere();
     let mut path = Line::from(p.project.path.clone());
     if p.loaded && p.error.is_some() {
@@ -184,6 +191,7 @@ fn project_row(p: &ProjectState, now: DateTime<Utc>) -> Row<'static> {
     }
     Row::new([
         status,
+        Cell::from(source.to_string()).dim(),
         Cell::from(path),
         Cell::from(p.project.default_branch.clone().unwrap_or_default()).dim(),
         Cell::from(
@@ -194,7 +202,7 @@ fn project_row(p: &ProjectState, now: DateTime<Utc>) -> Row<'static> {
         )
         .dim(),
         if elsewhere > 0 {
-            Cell::from(format!("+{elsewhere}")).style(status_style(Status::Running))
+            Cell::from(format!("{elsewhere} active")).style(status_style(Status::Running))
         } else {
             Cell::from("")
         },
@@ -249,7 +257,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc>)
         let table = Table::new(
             pipelines,
             [
-                Constraint::Length(11),
+                Constraint::Length(STATUS_WIDTH),
                 Constraint::Fill(3),
                 Constraint::Fill(2),
                 Constraint::Length(7),
@@ -327,7 +335,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     let (widths, header) = if stages {
         (
             vec![
-                Constraint::Length(11),
+                Constraint::Length(STATUS_WIDTH),
                 Constraint::Fill(1),
                 Constraint::Fill(2),
                 Constraint::Length(8),
@@ -337,7 +345,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     } else {
         (
             vec![
-                Constraint::Length(11),
+                Constraint::Length(STATUS_WIDTH),
                 Constraint::Fill(1),
                 Constraint::Length(8),
             ],
@@ -350,7 +358,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
 
 fn job_row(job: &Job, stages: bool, now: DateTime<Utc>) -> Row<'static> {
     let status = if job.allow_failure && job.status == Status::Failed {
-        Cell::from(format!("{} failed", status_symbol(Status::Failed))).fg(Color::Yellow)
+        Cell::from("failed").fg(Color::Yellow)
     } else {
         status_cell(job.status)
     };
@@ -402,6 +410,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 ("↑↓", "move"),
                 ("enter", "details"),
                 ("/", "filter"),
+                ("s", "sort"),
                 ("o", "open in browser"),
                 ("r", "refresh"),
             ]
@@ -570,13 +579,22 @@ mod tests {
 
         let list = render(&mut app);
         println!("{list}");
+        let order: Vec<usize> = ["xfbs/broken", "xfbs/ok", "xfbs/busy", "xfbs/empty"]
+            .iter()
+            .map(|p| list.find(p).unwrap())
+            .collect();
+        assert!(order.is_sorted(), "newest first, without pipelines last");
+        assert!(list.contains("1 running") && list.contains("1 failing"));
+        assert!(list.contains("2 active") && list.contains("sorted by age"));
+
+        app.handle_event(key(KeyCode::Char('s')));
+        let list = render(&mut app);
         let order: Vec<usize> = ["xfbs/broken", "xfbs/busy", "xfbs/ok", "xfbs/empty"]
             .iter()
             .map(|p| list.find(p).unwrap())
             .collect();
         assert!(order.is_sorted(), "failing, then busy, then ok, then none");
-        assert!(list.contains("1 running") && list.contains("1 failing"));
-        assert!(list.contains("+2"));
+        assert!(list.contains("sorted by status"));
 
         // Select the busy project and open the detail view on its tag pipeline.
         app.handle_event(key(KeyCode::Down));

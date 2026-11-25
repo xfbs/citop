@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
 use tokio::sync::mpsc;
@@ -124,6 +125,20 @@ impl ProjectState {
         pipelines
     }
 
+    /// The newest pipeline of the default branch's commit.
+    pub fn latest_default(&self) -> Option<&Pipeline> {
+        self.default
+            .as_ref()?
+            .pipelines
+            .iter()
+            .max_by_key(|p| p.created_at)
+    }
+
+    /// When the newest default branch pipeline was created.
+    pub fn age(&self) -> Option<DateTime<Utc>> {
+        self.latest_default().map(|p| p.created_at)
+    }
+
     /// Sort order, like htop sorting by CPU: what needs attention comes first.
     fn rank(&self) -> u8 {
         if !self.loaded {
@@ -163,6 +178,37 @@ pub enum Focus {
     Pipelines,
 }
 
+/// Order of the project list; `s` cycles through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// Newest default branch pipeline first.
+    Age,
+    /// What needs attention first: failed, errors, busy, ...
+    Status,
+    Name,
+    Source,
+}
+
+impl SortKey {
+    fn next(self) -> Self {
+        match self {
+            SortKey::Age => SortKey::Status,
+            SortKey::Status => SortKey::Name,
+            SortKey::Name => SortKey::Source,
+            SortKey::Source => SortKey::Age,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Age => "age",
+            SortKey::Status => "status",
+            SortKey::Name => "name",
+            SortKey::Source => "source",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -185,6 +231,7 @@ pub struct App {
     pub detail: bool,
     pub focus: Focus,
     pub mode: Mode,
+    pub sort: SortKey,
     pub filter: String,
     message: Option<(String, Instant)>,
     pub quit: bool,
@@ -217,6 +264,7 @@ impl App {
             detail: false,
             focus: Focus::Projects,
             mode: Mode::Normal,
+            sort: SortKey::Age,
             filter: String::new(),
             message: None,
             quit: false,
@@ -247,15 +295,20 @@ impl App {
             .filter(|p| filter.is_empty() || p.project.path.to_lowercase().contains(&filter))
             .collect();
         projects.sort_by(|a, b| {
-            a.rank()
-                .cmp(&b.rank())
-                .then_with(|| {
-                    a.project
-                        .path
-                        .to_lowercase()
-                        .cmp(&b.project.path.to_lowercase())
-                })
-                .then_with(|| a.key.source.cmp(&b.key.source))
+            match self.sort {
+                // Projects without pipelines last.
+                SortKey::Age => b.age().cmp(&a.age()),
+                SortKey::Status => a.rank().cmp(&b.rank()),
+                SortKey::Name => std::cmp::Ordering::Equal,
+                SortKey::Source => a.key.source.cmp(&b.key.source),
+            }
+            .then_with(|| {
+                a.project
+                    .path
+                    .to_lowercase()
+                    .cmp(&b.project.path.to_lowercase())
+            })
+            .then_with(|| a.key.source.cmp(&b.key.source))
         });
         projects
     }
@@ -480,6 +533,7 @@ impl App {
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('o') => self.open_selected(),
             KeyCode::Char('r') => self.refresh_selected(),
+            KeyCode::Char('s') => self.sort = self.sort.next(),
             _ => {}
         }
     }
