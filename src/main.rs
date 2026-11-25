@@ -1,19 +1,25 @@
+mod app;
 mod config;
 mod filter;
+mod format;
 mod http;
 mod model;
 mod provider;
 mod secret;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
 
+use crate::app::App;
 use crate::config::Config;
+use crate::format::{ago, elapsed, short_sha};
 use crate::model::Pipeline;
 use crate::provider::Source;
 
@@ -29,8 +35,7 @@ struct Args {
     #[arg(long)]
     check: bool,
 
-    /// Query every source once and print the result. A development aid until
-    /// the interactive UI exists.
+    /// Query every source once and print the result (development aid).
     #[arg(long, hide = true)]
     dump: bool,
 }
@@ -82,7 +87,62 @@ async fn run(args: Args) -> Result<()> {
     if args.dump {
         return dump(&config).await;
     }
-    bail!("the interactive UI is not implemented yet; try --check")
+    run_tui(&config).await
+}
+
+async fn run_tui(config: &Config) -> Result<()> {
+    let mut sources = Vec::new();
+    let mut skipped = Vec::new();
+    for source_config in &config.sources {
+        match Source::new(source_config) {
+            Ok(source) => sources.push(source),
+            Err(e) => skipped.push(format!("{e:#}")),
+        }
+    }
+    if sources.is_empty() {
+        anyhow::bail!("no usable sources: {}", skipped.join("; "));
+    }
+
+    let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(config, sources, tx);
+    if !skipped.is_empty() {
+        app.set_message(format!("skipped: {}", skipped.join("; ")));
+    }
+
+    // crossterm's event reading blocks, so it gets its own thread.
+    let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = ratatui::crossterm::event::read() {
+            if event_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut terminal = ratatui::init();
+    let result: Result<()> = async {
+        // Redraw at least once a second so that ages and durations tick.
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        while !app.quit {
+            app.tick();
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            tokio::select! {
+                _ = tick.tick() => {}
+                Some(update) = updates.recv() => {
+                    app.handle_update(update);
+                    // Apply everything that is ready before redrawing.
+                    while let Ok(update) = updates.try_recv() {
+                        app.handle_update(update);
+                    }
+                }
+                Some(event) = events.recv() => app.handle_event(event),
+            }
+        }
+        Ok(())
+    }
+    .await;
+    ratatui::restore();
+    result
 }
 
 async fn dump(config: &Config) -> Result<()> {
@@ -184,13 +244,12 @@ fn print_pipeline(pipeline: &Pipeline) {
         .as_deref()
         .map(|n| format!("\"{n}\" "))
         .unwrap_or_default();
-    let duration = match (pipeline.started_at, pipeline.finished_at) {
-        (Some(start), Some(end)) => format!(", took {}", human(end - start)),
-        (Some(start), None) => format!(", running for {}", human(Utc::now() - start)),
-        _ => String::new(),
-    };
+    let now = Utc::now();
+    let duration = elapsed(pipeline.started_at, pipeline.finished_at, now)
+        .map(|d| format!(", ran for {d}"))
+        .unwrap_or_default();
     println!(
-        "    {:<9} {}{}({}, {}) {} @ {}, created {}{}",
+        "    {:<9} {}{}({}, {}) {} @ {}, created {} ago{}",
         pipeline.status,
         number,
         name,
@@ -198,25 +257,7 @@ fn print_pipeline(pipeline: &Pipeline) {
         pipeline.trigger,
         pipeline.web_url,
         short_sha(&pipeline.sha),
-        ago(pipeline.created_at),
+        ago(pipeline.created_at, now),
         duration,
     );
-}
-
-fn short_sha(sha: &str) -> &str {
-    sha.get(..8).unwrap_or(sha)
-}
-
-fn ago(time: DateTime<Utc>) -> String {
-    format!("{} ago", human(Utc::now() - time))
-}
-
-fn human(duration: chrono::TimeDelta) -> String {
-    let secs = duration.num_seconds().max(0);
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
-        3600..86400 => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
-        _ => format!("{}d", secs / 86400),
-    }
 }
