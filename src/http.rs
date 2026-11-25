@@ -5,12 +5,12 @@
 //! contain mutations before they are sent. There is no way to issue any other
 //! kind of request through it.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Method, Response, StatusCode};
 use serde::Deserialize;
@@ -20,7 +20,6 @@ use url::Url;
 use crate::secret::Secret;
 
 const USER_AGENT: &str = concat!("citop/", env!("CARGO_PKG_VERSION"));
-const MAX_CACHE_ENTRIES: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -72,10 +71,33 @@ pub struct RateLimit {
     pub reset: Option<DateTime<Utc>>,
 }
 
-struct Cached {
-    etag: HeaderValue,
-    body: Vec<u8>,
-    next: Option<Url>,
+/// A response kept for conditional requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedResponse {
+    pub etag: String,
+    pub body: Vec<u8>,
+    /// The `rel="next"` pagination link of the response.
+    pub next: Option<String>,
+}
+
+/// Storage for responses to conditional requests. On GitHub, a 304 response
+/// does not count against the rate limit. Implementations are best effort.
+pub trait ResponseCache: Send + Sync {
+    fn load<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Option<CachedResponse>>;
+    fn store<'a>(&'a self, url: &'a Url, response: CachedResponse) -> BoxFuture<'a, ()>;
+}
+
+/// A cache that never has anything.
+pub struct NoCache;
+
+impl ResponseCache for NoCache {
+    fn load<'a>(&'a self, _url: &'a Url) -> BoxFuture<'a, Option<CachedResponse>> {
+        Box::pin(async { None })
+    }
+
+    fn store<'a>(&'a self, _url: &'a Url, _response: CachedResponse) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 struct Fetched {
@@ -85,16 +107,18 @@ struct Fetched {
 
 pub struct ReadOnlyClient {
     http: reqwest::Client,
-    /// Responses by URL for conditional requests. On GitHub, a 304 response
-    /// does not count against the rate limit.
-    cache: Mutex<HashMap<Url, Cached>>,
+    cache: Arc<dyn ResponseCache>,
     rate_limit: Mutex<Option<RateLimit>>,
 }
 
 impl ReadOnlyClient {
     /// The token is sent as `Authorization: Bearer`, which reqwest strips when
     /// following a redirect to another host.
-    pub fn new(token: &Secret, mut headers: HeaderMap) -> anyhow::Result<Self> {
+    pub fn new(
+        token: &Secret,
+        mut headers: HeaderMap,
+        cache: Arc<dyn ResponseCache>,
+    ) -> anyhow::Result<Self> {
         let mut auth = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .ok()
             .context("token contains characters that are not allowed in an HTTP header")?;
@@ -109,7 +133,7 @@ impl ReadOnlyClient {
             .context("could not create HTTP client")?;
         Ok(Self {
             http,
-            cache: Mutex::default(),
+            cache,
             rate_limit: Mutex::default(),
         })
     }
@@ -126,7 +150,7 @@ impl ReadOnlyClient {
 
     /// Like [`get_json`](Self::get_json), but uses a conditional request if
     /// this URL was fetched before. Only use this for URLs that are requested
-    /// repeatedly, as every distinct URL is cached.
+    /// repeatedly with the same query, as every distinct URL is cached.
     pub async fn get_json_cached<T: DeserializeOwned>(&self, url: Url) -> Result<T, HttpError> {
         let fetched = self.get(&url, true).await?;
         decode(&url, &fetched.body)
@@ -209,43 +233,43 @@ impl ReadOnlyClient {
     }
 
     async fn get(&self, url: &Url, use_cache: bool) -> Result<Fetched, HttpError> {
-        let etag = if use_cache {
-            self.cache.lock().unwrap().get(url).map(|c| c.etag.clone())
+        let cached = if use_cache {
+            self.cache.load(url).await
         } else {
             None
         };
-        let has_etag = etag.is_some();
+        let etag = cached
+            .as_ref()
+            .and_then(|c| HeaderValue::from_str(&c.etag).ok());
         let mut response = self.send_get(url, etag).await?;
         if response.status() == StatusCode::NOT_MODIFIED {
-            if let Some(cached) = self.cache.lock().unwrap().get(url) {
-                return Ok(Fetched {
-                    body: cached.body.clone(),
-                    next: cached.next.clone(),
-                });
+            match cached {
+                Some(cached) => {
+                    return Ok(Fetched {
+                        body: cached.body,
+                        next: cached.next.and_then(|n| Url::parse(&n).ok()),
+                    });
+                }
+                // Should not happen, as we only send `If-None-Match` with a cached body.
+                None => response = self.send_get(url, None).await?,
             }
-            // The entry was evicted in the meantime, so ask again unconditionally.
-            response = self.send_get(url, None).await?;
-        } else if has_etag && !response.status().is_success() {
-            self.cache.lock().unwrap().remove(url);
         }
 
         let next = next_link(response.headers());
-        let etag = response.headers().get(header::ETAG).cloned();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|e| e.to_str().ok())
+            .map(str::to_string);
         let body = self.read_body(Method::GET, url, response).await?;
 
         if use_cache && let Some(etag) = etag {
-            let mut cache = self.cache.lock().unwrap();
-            if cache.len() >= MAX_CACHE_ENTRIES {
-                cache.clear();
-            }
-            cache.insert(
-                url.clone(),
-                Cached {
-                    etag,
-                    body: body.clone(),
-                    next: next.clone(),
-                },
-            );
+            let response = CachedResponse {
+                etag,
+                body: body.clone(),
+                next: next.as_ref().map(Url::to_string),
+            };
+            self.cache.store(url, response).await;
         }
         Ok(Fetched { body, next })
     }

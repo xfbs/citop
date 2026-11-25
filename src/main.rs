@@ -4,12 +4,15 @@ mod filter;
 mod format;
 mod http;
 mod model;
+mod poller;
 mod provider;
 mod secret;
+mod store;
 mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,8 +23,11 @@ use futures::StreamExt;
 use crate::app::App;
 use crate::config::Config;
 use crate::format::{ago, elapsed, short_sha};
+use crate::http::{NoCache, ResponseCache};
 use crate::model::Pipeline;
+use crate::poller::Poller;
 use crate::provider::Source;
+use crate::store::Store;
 
 /// Like htop, but for CI pipelines.
 #[derive(Parser)]
@@ -91,11 +97,28 @@ async fn run(args: Args) -> Result<()> {
 }
 
 async fn run_tui(config: &Config) -> Result<()> {
+    // The store is shared with other citop processes. If it cannot be
+    // opened, run with a private in-memory one instead.
+    let mut store_problem = None;
+    let store = match store_path().map(|path| Store::open(&path)) {
+        Some(Ok(store)) => store,
+        Some(Err(e)) => {
+            store_problem = Some(format!("{e:#}; not saving state"));
+            Store::in_memory()?
+        }
+        None => {
+            store_problem = Some("no cache directory; not saving state".to_string());
+            Store::in_memory()?
+        }
+    };
+    let store = Arc::new(store);
+
     let mut sources = Vec::new();
     let mut skipped = Vec::new();
     for source_config in &config.sources {
-        match Source::new(source_config) {
-            Ok(source) => sources.push(source),
+        let cache: Arc<dyn ResponseCache> = store.clone();
+        match Source::new(source_config, cache) {
+            Ok(source) => sources.push(Arc::new(source)),
             Err(e) => skipped.push(format!("{e:#}")),
         }
     }
@@ -103,11 +126,19 @@ async fn run_tui(config: &Config) -> Result<()> {
         anyhow::bail!("no usable sources: {}", skipped.join("; "));
     }
 
-    let (tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = App::new(config, sources, tx);
-    if !skipped.is_empty() {
-        app.set_message(format!("skipped: {}", skipped.join("; ")));
+    let (commands_tx, commands) = tokio::sync::mpsc::unbounded_channel();
+    let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(&sources, commands_tx);
+    let problems: Vec<String> = store_problem
+        .into_iter()
+        .chain(skipped.into_iter().map(|s| format!("skipped: {s}")))
+        .collect();
+    if !problems.is_empty() {
+        app.set_message(problems.join("; "));
     }
+    let poller = Poller::new(config, store.clone(), &sources, updates_tx.clone());
+    tokio::spawn(poller.run(commands));
+    tokio::spawn(poller::watch(store, sources, updates_tx));
 
     // crossterm's event reading blocks, so it gets its own thread.
     let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -148,7 +179,7 @@ async fn run_tui(config: &Config) -> Result<()> {
 async fn dump(config: &Config) -> Result<()> {
     let since = Utc::now() - chrono::Duration::from_std(config.keep_finished)?;
     for source_config in &config.sources {
-        let source = match Source::new(source_config) {
+        let source = match Source::new(source_config, Arc::new(NoCache)) {
             Ok(source) => source,
             Err(e) => {
                 eprintln!("warning: {e:#}");
@@ -260,4 +291,9 @@ fn print_pipeline(pipeline: &Pipeline) {
         ago(pipeline.created_at, now),
         duration,
     );
+}
+
+/// `$XDG_CACHE_HOME/citop/state.db` or the platform equivalent.
+fn store_path() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("citop").join("state.db"))
 }

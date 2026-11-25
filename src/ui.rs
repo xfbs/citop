@@ -85,12 +85,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let mut right = Vec::new();
     for state in &app.sources {
         right.push(Span::from("  "));
-        right.push(Span::from(state.source.name.clone()).bold());
-        let text = if state.error.is_some() {
+        right.push(Span::from(state.name.clone()).bold());
+        let text = if state.error().is_some() {
             Span::styled(" error", status_style(Status::Failed))
-        } else if !state.discovered {
+        } else if !state.discovered() {
             Span::from(" loading…").dim()
-        } else if let Some(rate) = state.source.rate_limit() {
+        } else if let Some(rate) = state.rate_limit {
             let style = if rate.remaining * 10 < rate.limit {
                 Style::new().fg(Color::Red)
             } else {
@@ -154,7 +154,7 @@ fn draw_projects(frame: &mut Frame, area: Rect, app: &mut App, now: DateTime<Utc
         let text = if app
             .sources
             .iter()
-            .all(|s| s.discovered || s.error.is_some())
+            .all(|s| s.discovered() || s.error().is_some())
         {
             "No projects."
         } else {
@@ -300,7 +300,7 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(state) = app.jobs.get(&(project.key.clone(), pipeline.id)) else {
+    let Some(state) = app.jobs_for(project, pipeline.id) else {
         frame.render_widget(Paragraph::new("Loading…").dim(), inner);
         return;
     };
@@ -366,7 +366,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(error) = app
         .sources
         .iter()
-        .find_map(|s| s.error.as_ref().map(|e| format!(" {e}")))
+        .find_map(|s| s.error().map(|e| format!(" {e}")))
     // names the source already
     {
         Line::from(error).style(status_style(Status::Failed))
@@ -425,10 +425,15 @@ mod tests {
     use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 
     use super::*;
-    use crate::app::{ProjectKey, Update};
+    use std::sync::Arc;
+
+    use crate::app::Update;
     use crate::config::Config;
+    use crate::http::NoCache;
     use crate::model::{CommitStatus, Job, PipelineKind, Project};
+    use crate::poller::Command;
     use crate::provider::{Discovery, Source};
+    use crate::store::Store;
 
     fn project(path: &str) -> Project {
         Project {
@@ -486,19 +491,35 @@ mod tests {
         let config =
             Config::parse("[[source]]\nname = \"gitlab\"\ntype = \"gitlab\"\ntoken = \"x\"")
                 .unwrap();
-        let source = Source::new(&config.sources[0]).unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&config, vec![source], tx);
+        let source = Arc::new(Source::new(&config.sources[0], Arc::new(NoCache)).unwrap());
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(std::slice::from_ref(&source), tx);
+        let store = Store::in_memory().unwrap();
+        let (scope, instance) = (source.scope.clone(), source.instance.clone());
+        let mut seq = 0;
+        let mut sync = async |app: &mut App| {
+            let changes = store
+                .changes_since(seq, vec![scope.clone()], vec![instance.clone()])
+                .await
+                .unwrap();
+            seq = changes.seq;
+            app.handle_update(Update::Changes(changes));
+        };
 
         let paths = ["xfbs/ok", "xfbs/broken", "xfbs/busy", "xfbs/empty"];
-        app.handle_update(Update::Discovered {
-            source: 0,
-            result: Ok(Discovery {
-                projects: paths.iter().map(|p| project(p)).collect(),
-                warnings: vec![],
-                without_ci: 0,
-            }),
-        });
+        store.claim_discovery(&source.scope).await.unwrap();
+        store
+            .save_discovery(
+                &source.scope,
+                &source.instance,
+                Ok(Discovery {
+                    projects: paths.iter().map(|p| project(p)).collect(),
+                    warnings: vec![],
+                    without_ci: 0,
+                }),
+            )
+            .await
+            .unwrap();
         let main = || PipelineKind::Branch("main".into());
         let updates = [
             (
@@ -522,15 +543,14 @@ mod tests {
             ("xfbs/empty", None, vec![]),
         ];
         for (path, default, active) in updates {
-            app.handle_update(Update::Project {
-                key: ProjectKey {
-                    source: 0,
-                    id: path.into(),
-                },
-                default: Ok(default.and_then(|p| CommitStatus::new(vec![p]))),
-                active: Ok(active),
-            });
+            let default = default.and_then(|p| CommitStatus::new(vec![p]));
+            store
+                .save_project(&source.instance, path, Ok(default), Ok(active))
+                .await
+                .unwrap();
         }
+        sync(&mut app).await;
+        app.tick();
 
         let list = render(&mut app);
         println!("{list}");
@@ -547,46 +567,51 @@ mod tests {
         app.handle_event(key(KeyCode::Enter));
         app.handle_event(key(KeyCode::Down));
         assert_eq!(app.selected_pipeline().unwrap().0.id, 4);
-        // `tick` would create this entry when it starts the request.
-        app.jobs.insert(
-            (
-                ProjectKey {
-                    source: 0,
-                    id: "xfbs/busy".into(),
-                },
-                4,
-            ),
-            Default::default(),
+
+        // The app asks the poller for the jobs on screen.
+        app.tick();
+        let Some(Command::WantJobs {
+            pipeline, project, ..
+        }) = commands.try_recv().ok()
+        else {
+            panic!("expected a request for jobs");
+        };
+        assert_eq!((project.id.as_str(), pipeline.id), ("xfbs/busy", 4));
+        // Do what the poller would.
+        assert!(
+            store
+                .claim_jobs(&source.instance, "xfbs/busy", 4, true, 0)
+                .await
+                .unwrap()
         );
-        app.handle_update(Update::Jobs {
-            key: ProjectKey {
-                source: 0,
-                id: "xfbs/busy".into(),
+        let jobs = vec![
+            Job {
+                id: 1,
+                name: "build".into(),
+                stage: Some("build".into()),
+                status: Status::Success,
+                allow_failure: false,
+                started_at: Some(Utc::now() - TimeDelta::seconds(100)),
+                finished_at: Some(Utc::now() - TimeDelta::seconds(40)),
+                web_url: String::new(),
             },
-            pipeline: 4,
-            result: Ok(vec![
-                Job {
-                    id: 1,
-                    name: "build".into(),
-                    stage: Some("build".into()),
-                    status: Status::Success,
-                    allow_failure: false,
-                    started_at: Some(Utc::now() - TimeDelta::seconds(100)),
-                    finished_at: Some(Utc::now() - TimeDelta::seconds(40)),
-                    web_url: String::new(),
-                },
-                Job {
-                    id: 2,
-                    name: "publish".into(),
-                    stage: Some("release".into()),
-                    status: Status::Running,
-                    allow_failure: false,
-                    started_at: Some(Utc::now() - TimeDelta::seconds(30)),
-                    finished_at: None,
-                    web_url: String::new(),
-                },
-            ]),
-        });
+            Job {
+                id: 2,
+                name: "publish".into(),
+                stage: Some("release".into()),
+                status: Status::Running,
+                allow_failure: false,
+                started_at: Some(Utc::now() - TimeDelta::seconds(30)),
+                finished_at: None,
+                web_url: String::new(),
+            },
+        ];
+        store
+            .save_jobs(&source.instance, "xfbs/busy", 4, Ok(jobs))
+            .await
+            .unwrap();
+        sync(&mut app).await;
+
         let detail = render(&mut app);
         println!("{detail}");
         assert!(detail.contains("tag v1.2.0"));

@@ -1,7 +1,7 @@
 //! GitLab REST API (v4) backend.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use url::Url;
 
 use crate::filter::Target;
-use crate::http::{HttpError, RateLimit, ReadOnlyClient};
+use crate::http::{HttpError, RateLimit, ReadOnlyClient, ResponseCache};
 use crate::model::{Job, Pipeline, PipelineKind, Project, Status};
 use crate::secret::Secret;
 
@@ -40,7 +40,12 @@ enum Found {
 }
 
 impl GitLab {
-    pub fn new(source: &str, web_url: &Url, token: &Secret) -> Result<Self> {
+    pub fn new(
+        source: &str,
+        web_url: &Url,
+        token: &Secret,
+        cache: Arc<dyn ResponseCache>,
+    ) -> Result<Self> {
         let mut api = web_url.clone();
         api.path_segments_mut()
             .map_err(|_| anyhow!("`{web_url}` cannot be used as a base URL"))?
@@ -49,7 +54,7 @@ impl GitLab {
         Ok(Self {
             source: source.to_string(),
             api,
-            client: ReadOnlyClient::new(token, HeaderMap::new())?,
+            client: ReadOnlyClient::new(token, HeaderMap::new(), cache)?,
             details: Mutex::default(),
             latest: Mutex::default(),
         })
@@ -445,7 +450,13 @@ mod tests {
     use super::*;
 
     fn gitlab(url: &str) -> GitLab {
-        GitLab::new("test", &Url::parse(url).unwrap(), &Secret::new("t".into())).unwrap()
+        GitLab::new(
+            "test",
+            &Url::parse(url).unwrap(),
+            &Secret::new("t".into()),
+            Arc::new(crate::http::NoCache),
+        )
+        .unwrap()
     }
 
     #[test]

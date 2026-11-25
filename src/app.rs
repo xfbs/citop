@@ -1,30 +1,28 @@
-//! Application state, refresh scheduling and key handling for the TUI.
+//! Application state and key handling for the TUI.
 //!
-//! All state lives in [`App`] and is only touched from the UI loop. Network
-//! requests run as tokio tasks that report back through an [`Update`]
-//! channel, so the UI never blocks on the network.
+//! [`App`] is a view of the [`Store`](crate::store::Store): it applies the
+//! [`Changes`] that the watcher sends and rebuilds its project list from them.
+//! Fetching happens in the [`poller`](crate::poller), which [`App`] only
+//! talks to through [`Command`]s, so the UI never blocks on the network.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::TableState;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 
-use crate::config::Config;
+use crate::http::RateLimit;
 use crate::model::{CommitStatus, Job, Pipeline, Project, Status};
-use crate::provider::{Discovery, Source};
+use crate::poller::Command;
+use crate::provider::Source;
+use crate::store::{Changes, DiscoveryRow, JobsRow, ProjectRow};
 
-/// Concurrent requests per source, to be gentle on rate limits.
-const CONCURRENCY_PER_SOURCE: usize = 8;
-/// How often the project list of a source is fetched again.
-const REDISCOVER_EVERY: Duration = Duration::from_secs(10 * 60);
-/// How soon to retry a failed project discovery.
-const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
 /// How long a status message stays in the footer.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How often the poller is reminded which jobs are on screen.
+const WANT_JOBS_EVERY: Duration = Duration::from_secs(1);
 const PAGE: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -34,31 +32,31 @@ pub struct ProjectKey {
     pub id: String,
 }
 
-/// The result of a background request.
 pub enum Update {
-    Discovered {
-        source: usize,
-        result: anyhow::Result<Discovery>,
-    },
-    Project {
-        key: ProjectKey,
-        default: anyhow::Result<Option<CommitStatus>>,
-        active: anyhow::Result<Vec<Pipeline>>,
-    },
-    Jobs {
-        key: ProjectKey,
-        pipeline: u64,
-        result: anyhow::Result<Vec<Job>>,
-    },
+    /// Data that changed in the store.
+    Changes(Changes),
+    /// Something to tell the user.
+    Message(String),
 }
 
 pub struct SourceState {
-    pub source: Arc<Source>,
-    semaphore: Arc<Semaphore>,
-    pub discovered: bool,
-    discovering: bool,
-    next_discovery: Instant,
-    pub error: Option<String>,
+    pub name: String,
+    pub scope: String,
+    pub instance: String,
+    pub discovery: Option<DiscoveryRow>,
+    pub rate_limit: Option<RateLimit>,
+}
+
+impl SourceState {
+    pub fn discovered(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(|d| d.projects.is_some())
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.discovery.as_ref()?.error.as_deref()
+    }
 }
 
 pub struct ProjectState {
@@ -72,21 +70,17 @@ pub struct ProjectState {
     pub loaded: bool,
     /// Error of the most recent refresh. Earlier data is kept.
     pub error: Option<String>,
-    next_refresh: Instant,
-    in_flight: bool,
 }
 
 impl ProjectState {
-    fn new(key: ProjectKey, project: Project) -> Self {
+    fn new(key: ProjectKey, project: Project, row: Option<&ProjectRow>) -> Self {
         Self {
             key,
             project,
-            default: None,
-            active: Vec::new(),
-            loaded: false,
-            error: None,
-            next_refresh: Instant::now(),
-            in_flight: false,
+            default: row.and_then(|r| r.default.clone()),
+            active: row.map(|r| r.active.clone()).unwrap_or_default(),
+            loaded: row.is_some_and(|r| r.loaded),
+            error: row.and_then(|r| r.error.clone()),
         }
     }
 
@@ -147,13 +141,20 @@ impl ProjectState {
     }
 }
 
-#[derive(Default)]
 pub struct JobsState {
     pub jobs: Vec<Job>,
     pub loaded: bool,
     pub error: Option<String>,
-    fetched: Option<Instant>,
-    in_flight: bool,
+}
+
+impl From<JobsRow> for JobsState {
+    fn from(row: JobsRow) -> Self {
+        Self {
+            jobs: row.jobs,
+            loaded: row.loaded,
+            error: row.error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,12 +170,13 @@ pub enum Mode {
 }
 
 pub struct App {
-    refresh: Duration,
-    idle_refresh: Duration,
-    keep_finished: chrono::TimeDelta,
     pub sources: Vec<SourceState>,
+    /// Project state from the store, by instance and project id.
+    rows: HashMap<(String, String), ProjectRow>,
+    /// The projects of all sources, built from discoveries and `rows`.
     pub projects: HashMap<ProjectKey, ProjectState>,
-    pub jobs: HashMap<(ProjectKey, u64), JobsState>,
+    /// Jobs from the store, by instance, project id and pipeline id.
+    jobs: HashMap<(String, String, u64), JobsState>,
     pub selected: Option<ProjectKey>,
     pub pipeline_index: usize,
     pub detail: bool,
@@ -185,28 +187,25 @@ pub struct App {
     pub quit: bool,
     pub table_state: TableState,
     pub pipeline_state: TableState,
-    tx: mpsc::UnboundedSender<Update>,
+    commands: mpsc::UnboundedSender<Command>,
+    /// The pipeline whose jobs were last requested, and when.
+    wanted_jobs: Option<((ProjectKey, u64), Instant)>,
 }
 
 impl App {
-    pub fn new(config: &Config, sources: Vec<Source>, tx: mpsc::UnboundedSender<Update>) -> Self {
-        let now = Instant::now();
+    pub fn new(sources: &[Arc<Source>], commands: mpsc::UnboundedSender<Command>) -> Self {
         Self {
-            refresh: config.refresh,
-            idle_refresh: config.idle_refresh,
-            keep_finished: chrono::TimeDelta::from_std(config.keep_finished)
-                .unwrap_or(chrono::TimeDelta::hours(1)),
             sources: sources
-                .into_iter()
+                .iter()
                 .map(|source| SourceState {
-                    source: Arc::new(source),
-                    semaphore: Arc::new(Semaphore::new(CONCURRENCY_PER_SOURCE)),
-                    discovered: false,
-                    discovering: false,
-                    next_discovery: now,
-                    error: None,
+                    name: source.name.clone(),
+                    scope: source.scope.clone(),
+                    instance: source.instance.clone(),
+                    discovery: None,
+                    rate_limit: None,
                 })
                 .collect(),
+            rows: HashMap::new(),
             projects: HashMap::new(),
             jobs: HashMap::new(),
             selected: None,
@@ -219,7 +218,8 @@ impl App {
             quit: false,
             table_state: TableState::default(),
             pipeline_state: TableState::default(),
-            tx,
+            commands,
+            wanted_jobs: None,
         }
     }
 
@@ -267,60 +267,21 @@ impl App {
             .copied()
     }
 
-    /// Starts any requests that are due. Called on every loop iteration.
-    pub fn tick(&mut self) {
-        let now = Instant::now();
-        self.fix_selection();
-
-        for (index, state) in self.sources.iter_mut().enumerate() {
-            if state.discovering || now < state.next_discovery {
-                continue;
-            }
-            state.discovering = true;
-            let source = state.source.clone();
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let result = source.discover().await;
-                let _ = tx.send(Update::Discovered {
-                    source: index,
-                    result,
-                });
-            });
-        }
-
-        let since = Utc::now() - self.keep_finished;
-        for project in self.projects.values_mut() {
-            if project.in_flight || now < project.next_refresh {
-                continue;
-            }
-            project.in_flight = true;
-            let state = &self.sources[project.key.source];
-            let source = state.source.clone();
-            let semaphore = state.semaphore.clone();
-            let tx = self.tx.clone();
-            let key = project.key.clone();
-            let project = project.project.clone();
-            tokio::spawn(async move {
-                let _permit = semaphore.acquire_owned().await;
-                let (default, active) = futures::join!(
-                    source.default_branch(&project),
-                    source.active_pipelines(&project, since)
-                );
-                let _ = tx.send(Update::Project {
-                    key,
-                    default,
-                    active,
-                });
-            });
-        }
-
-        self.refresh_jobs(now);
+    /// The jobs of a pipeline of a project, if the store has them.
+    pub fn jobs_for(&self, project: &ProjectState, pipeline_id: u64) -> Option<&JobsState> {
+        let instance = self.sources[project.key.source].instance.clone();
+        self.jobs
+            .get(&(instance, project.key.id.clone(), pipeline_id))
     }
 
-    /// Fetches jobs of the pipeline shown in the detail view, and keeps them
-    /// fresh while it runs. Not rate limited by the semaphore: the user is
-    /// looking at it, so it should not queue behind background refreshes.
-    fn refresh_jobs(&mut self, now: Instant) {
+    /// Called on every loop iteration.
+    pub fn tick(&mut self) {
+        self.fix_selection();
+        self.want_jobs();
+    }
+
+    /// Tells the poller which jobs are on screen, so it keeps them fresh.
+    fn want_jobs(&mut self) {
         if !self.detail {
             return;
         }
@@ -331,136 +292,79 @@ impl App {
             return;
         };
         let key = (project.key.clone(), pipeline.id);
-        let active = pipeline.status.is_active();
-        let project = project.project.clone();
-        let pipeline = pipeline.clone();
-
-        // Only keep jobs for what is on screen.
-        self.jobs.retain(|k, _| *k == key);
-        let state = self.jobs.entry(key.clone()).or_default();
-        let due = match state.fetched {
-            None => true,
-            Some(at) => active && now.duration_since(at) >= self.refresh,
-        };
-        if state.in_flight || !due {
+        let recently = self
+            .wanted_jobs
+            .as_ref()
+            .is_some_and(|(k, at)| *k == key && at.elapsed() < WANT_JOBS_EVERY);
+        if recently {
             return;
         }
-        state.in_flight = true;
-        let source = self.sources[key.0.source].source.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let result = source.jobs(&project, &pipeline).await;
-            let _ = tx.send(Update::Jobs {
-                key: key.0,
-                pipeline: key.1,
-                result,
-            });
-        });
+        let command = Command::WantJobs {
+            source: key.0.source,
+            project: Box::new(project.project.clone()),
+            pipeline: Box::new(pipeline.clone()),
+        };
+        let _ = self.commands.send(command);
+        self.wanted_jobs = Some((key, Instant::now()));
     }
 
     pub fn handle_update(&mut self, update: Update) {
-        let now = Instant::now();
         match update {
-            Update::Discovered { source, result } => {
-                let state = &mut self.sources[source];
-                state.discovering = false;
-                match result {
-                    Ok(discovery) => {
-                        state.discovered = true;
-                        state.error = None;
-                        state.next_discovery = now + REDISCOVER_EVERY;
-                        if let Some(warning) = discovery.warnings.first() {
-                            let more = discovery.warnings.len() - 1;
-                            let warning = if more > 0 {
-                                format!("{warning} (and {more} more)")
-                            } else {
-                                warning.clone()
-                            };
-                            self.set_message(warning);
-                        }
-                        self.merge_projects(source, discovery.projects);
-                    }
-                    Err(e) => {
-                        state.error = Some(format!("{e:#}"));
-                        state.next_discovery = now + DISCOVERY_RETRY;
-                    }
-                }
-            }
-            Update::Project {
-                key,
-                default,
-                active,
-            } => {
-                let (refresh, idle_refresh) = (self.refresh, self.idle_refresh);
-                let Some(project) = self.projects.get_mut(&key) else {
-                    return;
-                };
-                project.in_flight = false;
-                let mut errors = Vec::new();
-                match default {
-                    Ok(default) => project.default = default,
-                    Err(e) => errors.push(format!("{e:#}")),
-                }
-                match active {
-                    Ok(active) => project.active = active,
-                    Err(e) => errors.push(format!("{e:#}")),
-                }
-                project.error = (!errors.is_empty()).then(|| errors.join("; "));
-                project.loaded |= project.error.is_none();
-                let interval = if project.is_busy() {
-                    refresh
-                } else {
-                    idle_refresh
-                };
-                project.next_refresh = now + interval;
-            }
-            Update::Jobs {
-                key,
-                pipeline,
-                result,
-            } => {
-                let Some(state) = self.jobs.get_mut(&(key, pipeline)) else {
-                    return;
-                };
-                state.in_flight = false;
-                state.fetched = Some(now);
-                match result {
-                    Ok(jobs) => {
-                        state.jobs = jobs;
-                        state.loaded = true;
-                        state.error = None;
-                    }
-                    Err(e) => state.error = Some(format!("{e:#}")),
-                }
-            }
+            Update::Message(message) => self.set_message(message),
+            Update::Changes(changes) => self.apply(changes),
         }
     }
 
-    /// Replaces the projects of a source with a freshly discovered list,
-    /// keeping the state of projects that are still there.
-    fn merge_projects(&mut self, source: usize, projects: Vec<Project>) {
-        let keys: HashSet<ProjectKey> = projects
-            .iter()
-            .map(|p| ProjectKey {
-                source,
-                id: p.id.clone(),
-            })
-            .collect();
-        self.projects
-            .retain(|key, _| key.source != source || keys.contains(key));
-        for project in projects {
-            let key = ProjectKey {
-                source,
-                id: project.id.clone(),
-            };
-            match self.projects.get_mut(&key) {
-                Some(state) => state.project = project,
-                None => {
-                    self.projects
-                        .insert(key.clone(), ProjectState::new(key, project));
-                }
+    fn apply(&mut self, changes: Changes) {
+        for (scope, discovery) in changes.discoveries {
+            if let Some(warning) = discovery.warnings.first() {
+                let more = discovery.warnings.len() - 1;
+                let warning = if more > 0 {
+                    format!("{warning} (and {more} more)")
+                } else {
+                    warning.clone()
+                };
+                self.set_message(warning);
+            }
+            for state in self.sources.iter_mut().filter(|s| s.scope == scope) {
+                state.discovery = Some(discovery.clone());
             }
         }
+        for (scope, rate) in changes.rate_limits {
+            for state in self.sources.iter_mut().filter(|s| s.scope == scope) {
+                state.rate_limit = Some(rate);
+            }
+        }
+        for row in changes.projects {
+            self.rows
+                .insert((row.instance.clone(), row.project_id.clone()), row);
+        }
+        for row in changes.jobs {
+            let key = (
+                row.instance.clone(),
+                row.project_id.clone(),
+                row.pipeline_id,
+            );
+            self.jobs.insert(key, row.into());
+        }
+        self.rebuild();
+    }
+
+    /// Rebuilds the project list from the discoveries and project rows.
+    fn rebuild(&mut self) {
+        let mut projects = HashMap::new();
+        for (index, state) in self.sources.iter().enumerate() {
+            let discovered = state.discovery.as_ref().and_then(|d| d.projects.as_ref());
+            for project in discovered.into_iter().flatten() {
+                let key = ProjectKey {
+                    source: index,
+                    id: project.id.clone(),
+                };
+                let row = self.rows.get(&(state.instance.clone(), project.id.clone()));
+                projects.insert(key.clone(), ProjectState::new(key, project.clone(), row));
+            }
+        }
+        self.projects = projects;
     }
 
     /// Keeps the selection on a visible project, and the pipeline index in range.
@@ -612,18 +516,14 @@ impl App {
     }
 
     fn refresh_selected(&mut self) {
-        let now = Instant::now();
         let Some(key) = self.selected.clone() else {
             return;
         };
-        if let Some(project) = self.projects.get_mut(&key) {
-            project.next_refresh = now;
-        }
-        for ((project, _), state) in &mut self.jobs {
-            if *project == key {
-                state.fetched = None;
-            }
-        }
+        let _ = self.commands.send(Command::Refresh {
+            source: key.source,
+            project_id: key.id,
+        });
+        self.set_message("refresh requested");
     }
 
     /// Counts for the header: (projects, busy, failing).
@@ -664,6 +564,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::model::PipelineKind;
+    use chrono::Utc;
 
     fn project(path: &str) -> Project {
         Project {
@@ -700,7 +601,7 @@ mod tests {
             source: 0,
             id: path.into(),
         };
-        let mut state = ProjectState::new(key, project(path));
+        let mut state = ProjectState::new(key, project(path), None);
         state.loaded = true;
         state.default = default.and_then(|s| {
             CommitStatus::new(vec![pipeline(1, s, PipelineKind::Branch("main".into()))])

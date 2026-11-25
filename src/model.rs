@@ -3,9 +3,10 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Normalized CI status shared by all providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Status {
     /// Waiting to start: created, pending, waiting for a runner, ...
     Queued,
@@ -59,7 +60,7 @@ impl fmt::Display for Status {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     /// Name of the config source this project belongs to.
     pub source: String,
@@ -77,7 +78,7 @@ pub struct Project {
 }
 
 /// What a pipeline was run for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PipelineKind {
     Branch(String),
     Tag(String),
@@ -95,7 +96,7 @@ impl fmt::Display for PipelineKind {
 }
 
 /// One GitLab pipeline or one GitHub workflow run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pipeline {
     pub id: u64,
     /// Per-project number shown in the web UI, if the provider has one.
@@ -115,11 +116,16 @@ pub struct Pipeline {
 }
 
 /// The CI state of a single commit, made up of one or more pipelines.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitStatus {
     pub sha: String,
     pub status: Status,
     pub pipelines: Vec<Pipeline>,
+}
+
+/// Whether anything is running or queued, on the default branch or elsewhere.
+pub fn is_busy(default: Option<&CommitStatus>, active: &[Pipeline]) -> bool {
+    default.is_some_and(|c| c.status.is_active()) || active.iter().any(|p| p.status.is_active())
 }
 
 impl CommitStatus {
@@ -134,7 +140,7 @@ impl CommitStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: u64,
     pub name: String,
