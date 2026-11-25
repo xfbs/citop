@@ -1,0 +1,35 @@
+# citop config. Default location: ~/.config/citop/config.toml
+# (override with --config or $CITOP_CONFIG).
+
+# How often to refresh projects with running pipelines, and idle ones.
+refresh = "5s"
+idle_refresh = "1m"
+# How long finished pipelines (on any branch, tag or MR) stay listed.
+keep_finished = "1h"
+
+# One [[source]] per account/instance. citop only ever reads: use tokens with
+# read-only scopes (GitLab: `read_api`; GitHub: fine-grained PAT with read
+# access to "Actions" and "Metadata").
+[[source]]
+name = "gitlab"
+type = "gitlab"
+# url = "https://gitlab.example.com"   # default: https://gitlab.com
+#
+# Exactly one of:
+token_env = "GITLAB_TOKEN"
+# token_cmd = "pass show gitlab/citop"   # stdout is the token
+# token = "glpat-..."                    # keep this file chmod 600
+#
+# Glob patterns on the full project path. `*` stays within one path
+# component, `**` crosses them. Exclude wins over include. Without include,
+# every project you are a member of is shown.
+include = ["mygroup/**", "someone/interesting-project"]
+exclude = ["mygroup/archive/**"]
+# exclude_archived = true   # default
+# exclude_forks = false     # default
+
+[[source]]
+name = "github"
+type = "github"
+token_env = "GITHUB_TOKEN"
+include = ["my-org/*"]
