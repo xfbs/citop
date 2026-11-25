@@ -178,6 +178,9 @@ pub struct App {
     /// Jobs from the store, by instance, project id and pipeline id.
     jobs: HashMap<(String, String, u64), JobsState>,
     pub selected: Option<ProjectKey>,
+    /// Whether the user moved the selection. Until then it stays on the top
+    /// row, instead of following a project down the list as states load.
+    moved: bool,
     pub pipeline_index: usize,
     pub detail: bool,
     pub focus: Focus,
@@ -209,6 +212,7 @@ impl App {
             projects: HashMap::new(),
             jobs: HashMap::new(),
             selected: None,
+            moved: false,
             pipeline_index: 0,
             detail: false,
             focus: Focus::Projects,
@@ -374,7 +378,7 @@ impl App {
             .selected
             .as_ref()
             .is_some_and(|s| visible.iter().any(|p| &p.key == s));
-        if !selected_visible {
+        if !selected_visible || !self.moved {
             let first = visible.first().map(|p| p.key.clone());
             self.select(first);
         }
@@ -405,6 +409,7 @@ impl App {
             .unwrap_or(0);
         let index = current.saturating_add_signed(delta).min(visible.len() - 1);
         let key = visible[index].key.clone();
+        self.moved = true;
         self.select(Some(key));
     }
 
@@ -450,6 +455,7 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.selected.is_some() {
                     self.detail = true;
+                    self.moved = true;
                     self.focus = Focus::Pipelines;
                 }
             }

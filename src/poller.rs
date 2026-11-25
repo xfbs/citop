@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::app::Update;
 use crate::config::Config;
+use crate::http::RateLimit;
 use crate::model::{Pipeline, Project};
 use crate::provider::Source;
 use crate::store::Store;
@@ -108,6 +109,15 @@ impl Poller {
 
         for polled in &mut self.sources {
             let source = polled.source.clone();
+            let pace = Pace::of(source.rate_limit(), now);
+            if pace == Pace::Paused {
+                continue;
+            }
+            // Short on requests: refresh busy projects as rarely as idle ones.
+            let busy_before = match pace {
+                Pace::Slow => idle_before,
+                _ => busy_before,
+            };
 
             if self.store.claim_discovery(&source.scope).await? {
                 let store = self.store.clone();
@@ -219,6 +229,40 @@ impl Poller {
     }
 }
 
+/// How fast a source may be polled, given its rate limit.
+#[derive(Debug, PartialEq, Eq)]
+enum Pace {
+    Normal,
+    /// Less than [`SLOW_BELOW`] of the limit left.
+    Slow,
+    /// Nearly nothing left; wait for the reset.
+    Paused,
+}
+
+/// Fraction of the rate limit below which polling slows down.
+const SLOW_BELOW: f64 = 0.2;
+/// Requests kept in reserve, e.g. for opening jobs.
+const PAUSE_BELOW: u64 = 20;
+
+impl Pace {
+    fn of(rate: Option<RateLimit>, now: DateTime<Utc>) -> Self {
+        let Some(rate) = rate else {
+            return Pace::Normal;
+        };
+        // After the reset, the remembered numbers are outdated.
+        if rate.reset.is_some_and(|reset| reset <= now) {
+            return Pace::Normal;
+        }
+        if rate.remaining < PAUSE_BELOW {
+            Pace::Paused
+        } else if (rate.remaining as f64) < rate.limit as f64 * SLOW_BELOW {
+            Pace::Slow
+        } else {
+            Pace::Normal
+        }
+    }
+}
+
 async fn save_rate_limit(store: &Store, source: &Source) {
     if let Some(rate) = source.rate_limit() {
         let _ = store.save_rate_limit(&source.scope, rate).await;
@@ -263,5 +307,27 @@ pub async fn watch(
                 let _ = updates.send(Update::Message(format!("state database: {e:#}")));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paces_by_rate_limit() {
+        let now = Utc::now();
+        let rate = |remaining, reset_in: i64| {
+            Some(RateLimit {
+                limit: 5000,
+                remaining,
+                reset: Some(now + chrono::TimeDelta::seconds(reset_in)),
+            })
+        };
+        assert_eq!(Pace::of(None, now), Pace::Normal);
+        assert_eq!(Pace::of(rate(4000, 60), now), Pace::Normal);
+        assert_eq!(Pace::of(rate(500, 60), now), Pace::Slow);
+        assert_eq!(Pace::of(rate(3, 60), now), Pace::Paused);
+        assert_eq!(Pace::of(rate(3, -1), now), Pace::Normal);
     }
 }

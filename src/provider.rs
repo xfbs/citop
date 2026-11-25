@@ -1,10 +1,11 @@
 //! CI providers, behind a common interface.
 
+mod github;
 mod gitlab;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::config::{SourceConfig, SourceKind};
@@ -30,6 +31,7 @@ pub struct Source {
 
 enum Backend {
     GitLab(gitlab::GitLab),
+    GitHub(github::GitHub),
 }
 
 pub struct Discovery {
@@ -49,10 +51,12 @@ impl Source {
                 &config.token,
                 cache,
             )?),
-            SourceKind::GitHub => bail!(
-                "source `{}`: GitHub support is not implemented yet",
-                config.name
-            ),
+            SourceKind::GitHub => Backend::GitHub(github::GitHub::new(
+                &config.name,
+                &config.url,
+                &config.token,
+                cache,
+            )?),
         };
         let instance = format!("{} {}", config.kind, config.url);
         let scope = format!(
@@ -80,6 +84,7 @@ impl Source {
         let targets = self.filter.discovery_targets();
         let (projects, warnings) = match &self.backend {
             Backend::GitLab(gl) => gl.discover(&targets, self.exclude_archived).await,
+            Backend::GitHub(gh) => gh.discover(&targets, self.exclude_archived).await,
         }
         .with_context(|| format!("source `{}`: could not list projects", self.name))?;
         let (mut projects, without_ci): (Vec<Project>, Vec<Project>) = projects
@@ -109,6 +114,7 @@ impl Source {
                 .await?
                 .into_iter()
                 .collect(),
+            Backend::GitHub(gh) => gh.latest_runs(project, branch).await?,
         };
         Ok(CommitStatus::new(pipelines))
     }
@@ -122,18 +128,21 @@ impl Source {
     ) -> Result<Vec<Pipeline>> {
         match &self.backend {
             Backend::GitLab(gl) => gl.active_pipelines(project, since).await,
+            Backend::GitHub(gh) => gh.active_runs(project, since).await,
         }
     }
 
     pub async fn jobs(&self, project: &Project, pipeline: &Pipeline) -> Result<Vec<Job>> {
         match &self.backend {
             Backend::GitLab(gl) => gl.jobs(project, pipeline.id).await,
+            Backend::GitHub(gh) => gh.jobs(project, pipeline.id).await,
         }
     }
 
     pub fn rate_limit(&self) -> Option<RateLimit> {
         match &self.backend {
             Backend::GitLab(gl) => gl.rate_limit(),
+            Backend::GitHub(gh) => gh.rate_limit(),
         }
     }
 }

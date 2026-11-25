@@ -83,6 +83,7 @@ pub enum PipelineKind {
     Branch(String),
     Tag(String),
     MergeRequest(u64),
+    PullRequest(u64),
 }
 
 impl fmt::Display for PipelineKind {
@@ -90,7 +91,8 @@ impl fmt::Display for PipelineKind {
         match self {
             PipelineKind::Branch(name) => write!(f, "branch {name}"),
             PipelineKind::Tag(name) => write!(f, "tag {name}"),
-            PipelineKind::MergeRequest(number) => write!(f, "MR {number}"),
+            PipelineKind::MergeRequest(number) => write!(f, "MR !{number}"),
+            PipelineKind::PullRequest(number) => write!(f, "PR #{number}"),
         }
     }
 }

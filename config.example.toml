@@ -28,8 +28,16 @@ exclude = ["mygroup/archive/**"]
 # exclude_archived = true   # default
 # exclude_forks = false     # default
 
+# GitHub: use a fine-grained PAT with read-only "Actions" and "Metadata"
+# permissions (classic PATs need the `repo` scope for private repositories,
+# which also allows writing). The rate limit is 5000 requests per hour; idle
+# repositories are checked with conditional requests, which do not count.
+# The default branch status comes from the workflow runs triggered by the
+# newest push; other runs (schedules, bots, manual dispatches) are listed
+# but do not change it.
 [[source]]
 name = "github"
 type = "github"
+# url = "https://github.example.com"   # GitHub Enterprise Server
 token_env = "GITHUB_TOKEN"
 include = ["my-org/*"]

@@ -321,21 +321,34 @@ fn draw_jobs(frame: &mut Frame, area: Rect, app: &App, now: DateTime<Utc>) {
         frame.render_widget(Paragraph::new("No jobs.").dim(), inner);
         return;
     }
-    let rows: Vec<Row> = state.jobs.iter().map(|j| job_row(j, now)).collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(11),
-            Constraint::Fill(1),
-            Constraint::Fill(2),
-            Constraint::Length(8),
-        ],
-    )
-    .header(Row::new(["STATUS", "STAGE", "JOB", "DURATION"]).bold());
+    // GitHub has no stages.
+    let stages = state.jobs.iter().any(|j| j.stage.is_some());
+    let rows: Vec<Row> = state.jobs.iter().map(|j| job_row(j, stages, now)).collect();
+    let (widths, header) = if stages {
+        (
+            vec![
+                Constraint::Length(11),
+                Constraint::Fill(1),
+                Constraint::Fill(2),
+                Constraint::Length(8),
+            ],
+            vec!["STATUS", "STAGE", "JOB", "DURATION"],
+        )
+    } else {
+        (
+            vec![
+                Constraint::Length(11),
+                Constraint::Fill(1),
+                Constraint::Length(8),
+            ],
+            vec!["STATUS", "JOB", "DURATION"],
+        )
+    };
+    let table = Table::new(rows, widths).header(Row::new(header).bold());
     frame.render_widget(table, inner);
 }
 
-fn job_row(job: &Job, now: DateTime<Utc>) -> Row<'static> {
+fn job_row(job: &Job, stages: bool, now: DateTime<Utc>) -> Row<'static> {
     let status = if job.allow_failure && job.status == Status::Failed {
         Cell::from(format!("{} failed", status_symbol(Status::Failed))).fg(Color::Yellow)
     } else {
@@ -345,12 +358,15 @@ fn job_row(job: &Job, now: DateTime<Utc>) -> Row<'static> {
     if job.allow_failure && job.status == Status::Failed {
         name.push_span(Span::from(" (allowed)").dim());
     }
-    Row::new([
-        status,
-        Cell::from(job.stage.clone().unwrap_or_default()).dim(),
-        Cell::from(name),
-        Cell::from(elapsed(job.started_at, job.finished_at, now).unwrap_or_default()),
-    ])
+    let mut cells = vec![status];
+    if stages {
+        cells.push(Cell::from(job.stage.clone().unwrap_or_default()).dim());
+    }
+    cells.push(Cell::from(name));
+    cells.push(Cell::from(
+        elapsed(job.started_at, job.finished_at, now).unwrap_or_default(),
+    ));
+    Row::new(cells)
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -615,7 +631,7 @@ mod tests {
         let detail = render(&mut app);
         println!("{detail}");
         assert!(detail.contains("tag v1.2.0"));
-        assert!(detail.contains("MR 17"));
+        assert!(detail.contains("MR !17"));
         assert!(detail.contains("★ branch main"));
         assert!(detail.contains("publish"));
     }

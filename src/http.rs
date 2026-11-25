@@ -179,6 +179,21 @@ impl ReadOnlyClient {
         Ok(items)
     }
 
+    /// Fetches one page of a paginated response that is not a plain array,
+    /// returning the link to the next page, if any.
+    pub async fn get_json_page<T: DeserializeOwned>(
+        &self,
+        url: Url,
+    ) -> Result<(T, Option<Url>), HttpError> {
+        let fetched = self.get(&url, false).await?;
+        if let Some(link) = &fetched.next
+            && link.origin() != url.origin()
+        {
+            return Err(HttpError::ForeignLink(Box::new(link.clone())));
+        }
+        Ok((decode(&url, &fetched.body)?, fetched.next))
+    }
+
     #[allow(dead_code)] // used for job logs
     pub async fn get_text(&self, url: Url) -> Result<String, HttpError> {
         let fetched = self.get(&url, false).await?;
